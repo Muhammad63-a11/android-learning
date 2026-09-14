@@ -1,0 +1,75 @@
+name: AI App Doctor APK Builder
+
+on:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "input/**"
+
+# Only one run at a time so a second push/dispatch can't collide with an
+# in-progress build in the same workspace.
+concurrency:
+  group: ai-app-doctor-apk-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Examine, repair, build and validate APK
+    runs-on: ubuntu-latest
+    # Generous ceiling: up to 12 build/repair attempts at 20 minutes each,
+    # plus toolchain downloads. Lower this once you know your project's
+    # real build time if you want faster failure feedback.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python requirements
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify exactly one Android project ZIP is present
+        run: |
+          shopt -s nullglob
+          zips=(input/*.zip input/*.ZIP)
+          count=${#zips[@]}
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No .zip file found in input/. Put exactly one Android project ZIP there (e.g. input/your-app.zip) and re-run."
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Multiple ZIP files found in input/: ${zips[*]}. Keep exactly one."
+            exit 1
+          fi
+          echo "Using: ${zips[0]}"
+
+      # The pipeline script itself installs OpenJDK 17, the Android
+      # command-line tools/SDK platform/build-tools, and (if needed) a
+      # compatible Gradle fallback - exactly like the original notebook's
+      # toolchain-preparation cell, just adapted to run non-interactively
+      # with sudo on a GitHub-hosted runner. It then runs the full
+      # examine -> diagnose -> repair -> build -> retry -> validate loop.
+      - name: Run AI App Doctor pipeline
+        id: doctor
+        run: python scripts/app_doctor_pipeline.py
+
+      # Runs whether the previous step succeeded or failed, so you always
+      # get the PDF report explaining what happened - and the APK too,
+      # whenever one was actually built and validated.
+      - name: Upload validated APK + PDF report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-app-doctor-validated-output
+          path: |
+            output/*.apk
+            output/*.pdf
+          if-no-files-found: warn
+          retention-days: 30
