@@ -1,0 +1,1578 @@
+#!/usr/bin/env python3
+"""
+AI App Doctor Pro — GitHub Actions build pipeline
+==================================================
+
+This is a non-interactive, CI-safe port of the "AI App Doctor Pro"
+Colab notebook. It performs the exact same stages the notebook did:
+
+    ZIP -> safe extraction -> project examination -> diagnosis ->
+    toolchain preparation (JDK, Android SDK, Gradle) -> deterministic
+    automatic repair -> real Gradle build -> retry/repair loop ->
+    locate + validate the exact APK (ZIP/manifest/DEX/signature/SHA-256) ->
+    PDF report
+
+Differences from the notebook (all required to run unattended in CI):
+  * No google.colab upload prompt — the ZIP is read from input/*.zip.
+  * No interactive "choose report format" prompt — this always produces
+    a single PDF report (per project requirements), never JSON/TXT files.
+  * The repair loop is extended with a few extra *environment-level*
+    auto-fixes (missing SDK platform, wrong JDK version, transient
+    network/dependency failures, out-of-memory) because a GitHub Actions
+    runner starts from a much emptier machine than Colab and needs to be
+    able to recover from those categories of failure on its own.
+  * Source-code level failures (compile errors, manifest merge
+    conflicts, duplicate classes, etc.) are still NEVER auto-rewritten.
+    That restriction is intentional and carried over unchanged from the
+    original notebook: silently rewriting a user's Kotlin/Java/XML is
+    not a "safe deterministic repair", it is a guess.
+
+This script always exits 0 for genuinely unexpected internal errors it
+can still report on, and exits with a non-zero code only when no
+validated APK could be produced — so the workflow can still upload the
+PDF report (and APK, if one exists) via `if: always()`.
+"""
+
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+# ------------------------------------------------------------------
+# 1. Configuration (mirrors notebook Cell 1)
+# ------------------------------------------------------------------
+
+MAX_REPAIR_ATTEMPTS = 12
+GRADLE_TIMEOUT_SECONDS = 1200  # 20 minutes per attempt
+BUILD_VARIANT = "debug"
+
+REPO_ROOT = Path(os.environ.get("GITHUB_WORKSPACE", os.getcwd())).resolve()
+INPUT_DIR = REPO_ROOT / "input"
+
+BASE_DIR = REPO_ROOT / ".doctor_workspace"
+WORK_DIR = BASE_DIR / "work"
+BACKUP_DIR = BASE_DIR / "backup"
+TOOLS_DIR = BASE_DIR / "tools"
+ANDROID_SDK_ROOT = str(BASE_DIR / "android-sdk")
+OUTPUT_DIR = REPO_ROOT / "output"
+
+for d in [WORK_DIR, BACKUP_DIR, TOOLS_DIR, OUTPUT_DIR, Path(ANDROID_SDK_ROOT)]:
+    d.mkdir(parents=True, exist_ok=True)
+
+IGNORE_DIRS = {".git", ".gradle", "build", "node_modules", ".idea", "captures", ".cxx"}
+MAX_UNCOMPRESSED_BYTES = 2 * 1024 * 1024 * 1024
+MAX_FILES = 50000
+
+RUN_LOG = []  # human-readable running log, folded into the PDF report
+
+
+def log(msg=""):
+    print(msg, flush=True)
+    RUN_LOG.append(str(msg))
+
+
+def run_capture(cmd, cwd=None, timeout=600, check=False, env=None):
+    log(f"\n$ {cmd}")
+    p = subprocess.run(
+        cmd, shell=True, cwd=cwd, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        timeout=timeout, env=env,
+    )
+    tail = p.stdout[-16000:] if p.stdout else ""
+    print(tail, flush=True)
+    RUN_LOG.append(tail)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"Command failed ({p.returncode}): {cmd}")
+    return p.returncode, p.stdout or ""
+
+
+def sudo_apt_install(*packages, timeout=600):
+    """Idempotent, non-interactive apt-get install with sudo (CI runners
+    are non-root, unlike the Colab root environment the notebook used)."""
+    run_capture("sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq", timeout=timeout, check=True)
+    pkgs = " ".join(packages)
+    run_capture(
+        f"sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq {pkgs}",
+        timeout=timeout, check=True,
+    )
+
+
+# ------------------------------------------------------------------
+# 2. Locate the Android project ZIP (replaces the Colab upload cell)
+# ------------------------------------------------------------------
+
+def find_input_zip():
+    if not INPUT_DIR.exists():
+        raise RuntimeError(f"input/ folder not found at {INPUT_DIR}")
+    candidates = sorted(INPUT_DIR.glob("*.zip"))
+    if not candidates:
+        raise RuntimeError(
+            "No .zip file found in input/. Put exactly one Android project "
+            "ZIP there (e.g. input/your-android-project.zip) and re-run."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(p.name for p in candidates)
+        raise RuntimeError(
+            f"Multiple ZIP files found in input/: {names}. "
+            "Keep exactly one Android project ZIP in input/."
+        )
+    zip_path = candidates[0]
+    log(f"Input ZIP: {zip_path}")
+    log(f"Size: {zip_path.stat().st_size:,} bytes")
+
+    try:
+        with zipfile.ZipFile(zip_path, "r") as z:
+            bad = z.testzip()
+            if bad:
+                raise RuntimeError(f"Source ZIP contains a corrupt entry: {bad}")
+    except zipfile.BadZipFile as e:
+        raise RuntimeError(f"Source file is not a valid ZIP: {e}")
+    log("Source ZIP integrity: PASS")
+    return zip_path
+
+
+# ------------------------------------------------------------------
+# 3. Safe extraction + project-root detection (mirrors notebook Cell 3)
+# ------------------------------------------------------------------
+
+def safe_extract(zip_path, dest_dir):
+    shutil.rmtree(dest_dir, ignore_errors=True)
+    os.makedirs(dest_dir, exist_ok=True)
+    try:
+        z = zipfile.ZipFile(zip_path, "r")
+    except zipfile.BadZipFile as e:
+        return False, f"Invalid/corrupt ZIP: {e}"
+    with z:
+        infos = z.infolist()
+        if len(infos) > MAX_FILES:
+            return False, f"ZIP contains {len(infos)} entries; safety limit is {MAX_FILES}."
+        total = sum(i.file_size for i in infos)
+        if total > MAX_UNCOMPRESSED_BYTES:
+            return False, "ZIP expands beyond the 2 GB safety limit."
+        root = os.path.realpath(dest_dir)
+        for i in infos:
+            target = os.path.realpath(os.path.join(dest_dir, i.filename))
+            if not (target == root or target.startswith(root + os.sep)):
+                return False, f"Path traversal detected in ZIP entry: {i.filename}"
+        bad = z.testzip()
+        if bad:
+            return False, f"Corrupt ZIP member: {bad}"
+        z.extractall(dest_dir)
+    return True, "OK"
+
+
+def find_files(root, names):
+    names = set(names)
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for f in filenames:
+            if f in names:
+                hits.append(os.path.join(dirpath, f))
+    return hits
+
+
+def detect_project_root(work_dir):
+    settings = find_files(work_dir, ["settings.gradle", "settings.gradle.kts"])
+    builds = find_files(work_dir, ["build.gradle", "build.gradle.kts"])
+    manifests = find_files(work_dir, ["AndroidManifest.xml"])
+    if not settings and not builds and not manifests:
+        return None, {"settings": [], "build_files": [], "manifests": []}
+    if settings:
+        roots = [os.path.dirname(p) for p in settings]
+    elif builds:
+        roots = [os.path.dirname(p) for p in builds]
+    else:
+        roots = [os.path.dirname(p) for p in manifests]
+    root = min(roots, key=lambda p: len(Path(p).parts))
+    return root, {"settings": settings, "build_files": builds, "manifests": manifests}
+
+
+# ------------------------------------------------------------------
+# 4. Full static examination (mirrors notebook Cell 4)
+# ------------------------------------------------------------------
+
+findings = []
+
+
+def finding(check, status, detail, severity=0, evidence=None):
+    findings.append({
+        "check": check, "status": status, "detail": detail,
+        "severity": severity, "evidence": evidence or {}
+    })
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def rel(path, project):
+    return os.path.relpath(path, project).replace("\\", "/")
+
+
+def run_examination(project, evidence):
+    global gradlew, wrapper_props, wrapper_jar, AGP, KOTLIN, compile_sdk
+    global target_sdk, min_sdk, WRAPPER_GRADLE, STATIC_SCORE
+
+    finding("Android project structure", "PASS", "Gradle/Android project files were detected.")
+
+    gradlew = Path(project) / "gradlew"
+    wrapper_props = Path(project) / "gradle/wrapper/gradle-wrapper.properties"
+    wrapper_jar = Path(project) / "gradle/wrapper/gradle-wrapper.jar"
+
+    if gradlew.exists() and wrapper_props.exists():
+        finding("Gradle wrapper files", "PASS", "gradlew and gradle-wrapper.properties found.")
+    else:
+        finding("Gradle wrapper files", "WARN",
+                "Gradle wrapper is incomplete. The builder can use a compatible downloaded Gradle fallback.",
+                1)
+
+    if gradlew.exists() and wrapper_props.exists() and not wrapper_jar.exists():
+        finding("Gradle wrapper JAR", "WARN",
+                "gradle-wrapper.jar is missing. The wrapper cannot run, but the builder will recover by using "
+                "the Gradle distribution declared in gradle-wrapper.properties.", 2)
+    elif wrapper_jar.exists():
+        size = wrapper_jar.stat().st_size
+        if size < 1024:
+            finding("Gradle wrapper JAR", "WARN",
+                    f"gradle-wrapper.jar exists but is only {size} bytes and is likely truncated/corrupt. "
+                    "The builder will bypass it with the declared Gradle distribution.", 2)
+        else:
+            finding("Gradle wrapper JAR", "PASS", f"gradle-wrapper.jar found ({size:,} bytes).")
+
+    if evidence["manifests"]:
+        finding("AndroidManifest", "PASS", f"{len(evidence['manifests'])} manifest file(s) found.")
+    else:
+        finding("AndroidManifest", "FAIL", "No AndroidManifest.xml found.", 3)
+
+    if evidence["settings"]:
+        finding("Gradle settings", "PASS", "settings.gradle(.kts) found.")
+    else:
+        finding("Gradle settings", "FAIL", "No settings.gradle(.kts) found.", 3)
+
+    if evidence["build_files"]:
+        finding("Gradle build files", "PASS", f"{len(evidence['build_files'])} build file(s) found.")
+    else:
+        finding("Gradle build files", "FAIL", "No build.gradle(.kts) found.", 3)
+
+    catalog_path = Path(project) / "gradle/libs.versions.toml"
+    catalog_versions = {}
+    if catalog_path.exists():
+        try:
+            import tomllib
+            catalog = tomllib.loads(catalog_path.read_text(encoding="utf-8", errors="replace"))
+            catalog_versions = catalog.get("versions", {}) or {}
+        except Exception as e:
+            finding("Version catalog", "WARN",
+                    f"gradle/libs.versions.toml exists but could not be parsed by TOML parser: {e}", 1)
+    else:
+        finding("Version catalog", "INFO", "gradle/libs.versions.toml not present.")
+
+    all_gradle_files = [Path(p) for p in evidence["build_files"] + evidence["settings"]]
+    all_text = "\n".join(read_text(p) for p in all_gradle_files)
+
+    def first_regex(pattern, text=all_text):
+        m = re.search(pattern, text, re.I | re.M)
+        return m.group(1) if m else None
+
+    def catalog_version(*keys):
+        for k in keys:
+            if k in catalog_versions:
+                v = catalog_versions[k]
+                if isinstance(v, (str, int, float)):
+                    return str(v)
+        return None
+
+    AGP = first_regex(r'(?:com\.android\.application|com\.android\.library)[^\n]*version\s*["\']([^"\']+)', all_text)
+    KOTLIN = first_regex(r'(?:org\.jetbrains\.kotlin\.android|org\.jetbrains\.kotlin)[^\n]*version\s*["\']([^"\']+)', all_text)
+
+    if not AGP:
+        AGP = catalog_version("agp", "android-gradle-plugin", "androidGradlePlugin")
+    if not KOTLIN:
+        KOTLIN = catalog_version("kotlin", "kotlinVersion")
+
+    compile_sdk = None
+    compile_source = None
+    patterns = [
+        (r'compileSdk(?:Version)?\s*(?:=\s*)?(?:release\()?\s*(\d+)', "Gradle build file"),
+        (r'compileSdk(?:Version)?\s+([0-9]+)', "Gradle build file"),
+    ]
+    for pat, source in patterns:
+        m = re.search(pat, all_text, re.I)
+        if m:
+            compile_sdk = int(m.group(1)); compile_source = source; break
+
+    if compile_sdk is None:
+        refs = re.findall(r'compileSdk(?:Version)?\s*=\s*libs\.versions\.([A-Za-z0-9_.-]+)(?:\.get\(\))?(?:\.toInt\(\))?', all_text)
+        for key in refs:
+            v = catalog_version(key)
+            if v and str(v).isdigit():
+                compile_sdk = int(v)
+                compile_source = f"gradle/libs.versions.toml -> [versions].{key}"
+                break
+
+    if compile_sdk is None:
+        refs = re.findall(r'compileSdk(?:Version)?\s*=\s*(?:project\.)?findProperty\(["\']([^"\']+)["\']\)', all_text)
+        for key in refs:
+            v = catalog_version(key)
+            if v and str(v).isdigit():
+                compile_sdk = int(v)
+                compile_source = f"project property: {key}"
+                break
+
+    target_sdk = first_regex(r'targetSdk(?:Version)?\s*(?:=\s*)?(?:release\()?\s*(\d+)')
+    min_sdk = first_regex(r'minSdk(?:Version)?\s*(?:=\s*)?(?:release\()?\s*(\d+)')
+
+    if compile_sdk is not None:
+        finding("compileSdk", "PASS",
+                f"{compile_sdk} detected from {compile_source}.",
+                evidence={"value": compile_sdk, "source": compile_source})
+    else:
+        finding("compileSdk", "INFO",
+                "Not confidently detected. No hard-coded compileSdk or resolvable version-catalog reference was found.")
+
+    finding("Android Gradle Plugin", "INFO", AGP or "Not confidently detected.", evidence={"value": AGP})
+    finding("Kotlin version", "INFO", KOTLIN or "Not confidently detected.", evidence={"value": KOTLIN})
+    finding("targetSdk", "INFO", target_sdk or "Not confidently detected.", evidence={"value": target_sdk})
+    finding("minSdk", "INFO", min_sdk or "Not confidently detected.", evidence={"value": min_sdk})
+
+    WRAPPER_GRADLE = None
+    if wrapper_props.exists():
+        m = re.search(r'distributionUrl=.*?gradle-([0-9.]+)-(?:bin|all)\.zip', read_text(wrapper_props))
+        if m:
+            WRAPPER_GRADLE = m.group(1)
+    finding("Gradle distribution", "PASS" if WRAPPER_GRADLE else "INFO",
+            WRAPPER_GRADLE or "Not confidently detected from wrapper properties.",
+            evidence={"value": WRAPPER_GRADLE})
+
+    SECRET_RULES = [
+        ("Google API key", r'AIza[0-9A-Za-z_-]{20,}', 0.94),
+        ("OpenAI-style secret", r'sk-[A-Za-z0-9_-]{20,}', 0.90),
+        ("GitHub token", r'gh[pousr]_[A-Za-z0-9_]{20,}', 0.96),
+        ("Generic API key assignment", r'(?i)(?:api[_-]?key|apikey)\s*[:=]\s*["\']([^"\']+)["\']', 0.72),
+        ("Generic password assignment", r'(?i)(?:password|passwd|secret)\s*[:=]\s*["\']([^"\']+)["\']', 0.68),
+        ("Bearer token", r'(?i)Bearer\s+[A-Za-z0-9._-]{20,}', 0.78),
+    ]
+    PLACEHOLDERS = ("your_", "your-", "xxxx", "changeme", "example", "placeholder",
+                    "test_key", "test-key", "dummy", "replace_me", "replace-me",
+                    "<api_key>", "<your", "null", "none")
+
+    secret_hits = []
+    scan_ext = (".kt", ".java", ".gradle", ".kts", ".xml", ".properties", ".json", ".env", ".txt")
+    for dirpath, dirnames, filenames in os.walk(project):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for fname in filenames:
+            if not fname.endswith(scan_ext):
+                continue
+            p = Path(dirpath) / fname
+            text = read_text(p)
+            for label, pat, base_conf in SECRET_RULES:
+                for m in re.finditer(pat, text):
+                    line_no = text[:m.start()].count("\n") + 1
+                    raw = m.group(0)
+                    low = raw.lower()
+                    if any(x in low for x in PLACEHOLDERS):
+                        continue
+                    confidence = base_conf
+                    if label == "Generic API key assignment":
+                        val = m.group(1) if m.lastindex else raw
+                        if val.startswith(("http://", "https://")):
+                            continue
+                        if len(val) < 12:
+                            confidence = 0.45
+                        elif len(val) > 20:
+                            confidence = min(0.88, confidence + 0.08)
+                    secret_hits.append({
+                        "file": rel(p, project), "line": line_no, "type": label,
+                        "confidence": round(confidence * 100),
+                        "match": raw[:80]
+                    })
+
+    if secret_hits:
+        summary = "; ".join(
+            f"{h['file']}:{h['line']} - {h['type']} ({h['confidence']}%)"
+            for h in secret_hits[:10]
+        )
+        finding("Secret scan", "WARN", f"{len(secret_hits)} credential-like finding(s): {summary}",
+                2, evidence={"hits": secret_hits})
+    else:
+        finding("Secret scan", "PASS", "No high-confidence credential-like patterns found.")
+
+    source_files = []
+    for dirpath, dirnames, filenames in os.walk(project):
+        dirnames[:] = [d for d in dirnames if d not in IGNORE_DIRS]
+        for fname in filenames:
+            if fname.endswith((".kt", ".java")):
+                source_files.append(Path(dirpath) / fname)
+    finding("Kotlin/Java source", "PASS" if source_files else "WARN",
+            f"{len(source_files)} Kotlin/Java source file(s) found.", 0 if source_files else 1)
+
+    score = 100
+    for f in findings:
+        if f["status"] == "FAIL":
+            score -= 18
+        elif f["status"] == "WARN":
+            score -= 8
+    STATIC_SCORE = max(0, min(100, score))
+
+    log("\n" + "=" * 90)
+    log(f"STATIC HEALTH: {STATIC_SCORE}/100")
+    log("=" * 90)
+    for f in findings:
+        icon = {"PASS": "[PASS]", "WARN": "[WARN]", "FAIL": "[FAIL]", "INFO": "[INFO]"}.get(f["status"], "-")
+        log(f"{icon} {f['check']} - {f['detail']}")
+
+    return STATIC_SCORE
+
+
+# ------------------------------------------------------------------
+# 5. Diagnosis (mirrors notebook Cell 5)
+# ------------------------------------------------------------------
+
+def diagnose_findings():
+    diagnoses = []
+
+    wrapper_problem = any(
+        f["check"] in ("Gradle wrapper files", "Gradle wrapper JAR")
+        and f["status"] in ("WARN", "FAIL")
+        for f in findings
+    )
+    if wrapper_problem:
+        diagnoses.append({
+            "title": "Gradle wrapper packaging problem",
+            "severity": "Medium",
+            "cause": "The ZIP does not contain a fully usable Gradle wrapper.",
+            "treatment": "Use the Gradle version declared by gradle-wrapper.properties as a fallback, then build normally.",
+            "auto": True
+        })
+
+    for f in findings:
+        if f["check"] == "Secret scan" and f["status"] == "WARN":
+            diagnoses.append({
+                "title": "Potential credential exposure",
+                "severity": "Medium",
+                "cause": "A credential-like value was found in source/configuration.",
+                "treatment": "Review the exact file/line. Move real credentials to secure configuration and rotate exposed credentials if necessary. The Doctor will not silently delete or replace secrets.",
+                "auto": False
+            })
+
+    if any(f["check"] == "compileSdk" and f["status"] == "INFO" for f in findings):
+        diagnoses.append({
+            "title": "compileSdk could not be resolved statically",
+            "severity": "Low",
+            "cause": "No hard-coded value or supported version-catalog relationship was found.",
+            "treatment": "The real Gradle build remains the source of truth. The Doctor will avoid inventing a compileSdk value.",
+            "auto": False
+        })
+
+    structural_fail = [f for f in findings if f["status"] == "FAIL"]
+    for f in structural_fail:
+        diagnoses.append({
+            "title": f"{f['check']} failure",
+            "severity": "High",
+            "cause": f["detail"],
+            "treatment": "Repair or restore the missing structural project component before a meaningful build.",
+            "auto": False
+        })
+
+    if not diagnoses:
+        diagnoses.append({
+            "title": "No static blocker detected",
+            "severity": "Low",
+            "cause": "The project structure and configuration look healthy.",
+            "treatment": "Proceed to the real Gradle build. Compiler and dependency output is the final authority.",
+            "auto": True
+        })
+    return diagnoses
+
+
+# ------------------------------------------------------------------
+# 6. Toolchain preparation: JDK 17 + Android SDK + Gradle fallback
+#    (mirrors notebook Cell 7, adapted for a non-root CI runner)
+# ------------------------------------------------------------------
+
+INSTALLED_JDKS = {}  # major version (int) -> JAVA_HOME path
+
+
+def _existing_jdk_home(major):
+    for candidate in [
+        f"/usr/lib/jvm/java-{major}-openjdk-amd64",
+        f"/usr/lib/jvm/java-{major}-openjdk",
+        f"/usr/lib/jvm/temurin-{major}-jdk-amd64",
+    ]:
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def ensure_jdk(major):
+    """Install (if needed) and return JAVA_HOME for the given JDK major version.
+    Used both for the initial JDK 17 install and, later, as part of the
+    self-healing repair loop if Gradle reports it needs a different JDK."""
+    if major in INSTALLED_JDKS:
+        return INSTALLED_JDKS[major]
+    home = _existing_jdk_home(major)
+    if not home:
+        log(f"Installing OpenJDK {major}...")
+        sudo_apt_install(f"openjdk-{major}-jdk", timeout=600)
+        home = _existing_jdk_home(major)
+    if not home:
+        raise RuntimeError(f"JDK {major} could not be installed/found.")
+    INSTALLED_JDKS[major] = home
+    return home
+
+
+def activate_jdk(major):
+    home = ensure_jdk(major)
+    os.environ["JAVA_HOME"] = home
+    path_parts = [p for p in os.environ["PATH"].split(":") if "/jvm/" not in p]
+    os.environ["PATH"] = home + "/bin:" + ":".join(path_parts)
+    run_capture("java -version", check=True)
+    return home
+
+
+def major(v):
+    try:
+        return int(str(v).split(".")[0])
+    except Exception:
+        return None
+
+
+def choose_gradle(agp):
+    if not agp:
+        return "8.6"
+    try:
+        parts = tuple(int(x) for x in agp.split(".")[:2])
+    except Exception:
+        return "8.6"
+    if parts >= (9, 0): return "9.3.1"
+    if parts >= (8, 7): return "8.9"
+    if parts >= (8, 5): return "8.7"
+    if parts >= (8, 4): return "8.6"
+    if parts >= (8, 2): return "8.2"
+    if parts >= (8, 0): return "8.0"
+    if parts >= (7, 4): return "7.5"
+    if parts >= (7, 0): return "7.4"
+    return "6.9"
+
+
+def prepare_toolchain(project):
+    global GRADLE_VERSION, SDKMANAGER
+
+    GRADLE_VERSION = WRAPPER_GRADLE or choose_gradle(AGP)
+    log(f"AGP: {AGP or 'unknown'}")
+    log(f"Wrapper Gradle: {WRAPPER_GRADLE or 'not detected'}")
+    log(f"Selected fallback Gradle: {GRADLE_VERSION}")
+    log(f"compileSdk: {compile_sdk if compile_sdk is not None else 'not statically resolved'}")
+
+    # 1. wget/unzip/zip (used later for SDK/Gradle downloads)
+    sudo_apt_install("wget", "unzip", "zip", timeout=300)
+
+    # 2. JDK 17 (the notebook's default; other JDKs are installed on-demand
+    #    later only if the build itself reports it needs a different one)
+    activate_jdk(17)
+
+    # 3. Android command-line tools
+    os.environ["ANDROID_SDK_ROOT"] = ANDROID_SDK_ROOT
+    os.environ["ANDROID_HOME"] = ANDROID_SDK_ROOT
+
+    sdkmanager = None
+    for x in [
+        f"{ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager",
+        f"{ANDROID_SDK_ROOT}/cmdline-tools/bin/sdkmanager",
+    ]:
+        if os.path.exists(x):
+            sdkmanager = x
+            break
+
+    if sdkmanager is None:
+        cmdzip = "/tmp/android_cmdline_tools.zip"
+        url = "https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip"
+        log("Downloading Android command-line tools...")
+        run_capture(f"wget -q -O {cmdzip} '{url}'", timeout=600, check=True)
+        tmp = "/tmp/android_cmdline_extract"
+        shutil.rmtree(tmp, ignore_errors=True)
+        os.makedirs(tmp, exist_ok=True)
+        run_capture(f"unzip -q {cmdzip} -d {tmp}", check=True)
+        dest = Path(ANDROID_SDK_ROOT) / "cmdline-tools/latest"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.copytree(Path(tmp) / "cmdline-tools", dest)
+        sdkmanager = str(dest / "bin/sdkmanager")
+
+    os.environ["PATH"] = (
+        f"{ANDROID_SDK_ROOT}/platform-tools:"
+        f"{ANDROID_SDK_ROOT}/cmdline-tools/latest/bin:"
+        f"{os.environ['JAVA_HOME']}/bin:" + os.environ["PATH"]
+    )
+    SDKMANAGER = sdkmanager
+
+    run_capture(f"yes | {sdkmanager} --licenses >/dev/null 2>&1 || true", timeout=300)
+
+    sdk_for_build = int(compile_sdk) if compile_sdk is not None else 35
+    run_capture(f"{sdkmanager} 'platform-tools' 'platforms;android-{sdk_for_build}'",
+                timeout=1200, check=True)
+    run_capture(f"{sdkmanager} 'build-tools;36.0.0'", timeout=1200, check=True)
+
+    Path(project, "local.properties").write_text(f"sdk.dir={ANDROID_SDK_ROOT}\n", encoding="utf-8")
+    log("Toolchain preparation complete.")
+
+
+def install_sdk_platform(sdk_int):
+    """On-demand SDK platform install, used by the repair loop when Gradle
+    itself reveals a compileSdk/target that differs from what was
+    statically detected (e.g. a version-catalog value we couldn't parse)."""
+    run_capture(f"{SDKMANAGER} 'platforms;android-{sdk_int}'", timeout=1200, check=True)
+
+
+def install_build_tools(version):
+    run_capture(f"{SDKMANAGER} 'build-tools;{version}'", timeout=1200, check=True)
+
+
+# ------------------------------------------------------------------
+# 7. Deterministic automatic repair engine (mirrors notebook Cell 8)
+# ------------------------------------------------------------------
+
+def write_text(path, text):
+    Path(path).write_text(text, encoding="utf-8")
+
+
+def ensure_gradle_property(project, key, value):
+    p = Path(project) / "gradle.properties"
+    text = read_text(p) if p.exists() else ""
+    if re.search(rf"(?m)^\s*{re.escape(key)}\s*=", text):
+        return False
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"{key}={value}\n"
+    write_text(p, text)
+    return True
+
+
+def set_gradle_property(project, key, value):
+    """Overwrite (not just add) a gradle.properties value. Used by the
+    out-of-memory auto-fix, which needs to *raise* an existing value."""
+    p = Path(project) / "gradle.properties"
+    text = read_text(p) if p.exists() else ""
+    if re.search(rf"(?m)^\s*{re.escape(key)}\s*=.*$", text):
+        text = re.sub(rf"(?m)^\s*{re.escape(key)}\s*=.*$", f"{key}={value}", text)
+    else:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text += f"{key}={value}\n"
+    write_text(p, text)
+
+
+def ensure_debug_keystore(project, java_home):
+    referenced = False
+    for p in Path(project).rglob("build.gradle*"):
+        if "debug.keystore" in read_text(p):
+            referenced = True
+            break
+    if not referenced:
+        return False
+    targets = [Path(project) / "debug.keystore", Path(project) / "app/debug.keystore"]
+    if any(p.exists() for p in targets):
+        return False
+    keytool = Path(java_home) / "bin/keytool"
+    target = targets[0]
+    cmd = (
+        f'"{keytool}" -genkeypair -v -keystore "{target}" '
+        f'-storepass android -alias androiddebugkey -keypass android '
+        f'-keyalg RSA -keysize 2048 -validity 10000 '
+        f'-dname "CN=Android Debug,O=Android,C=US"'
+    )
+    rc, out = run_capture(cmd, cwd=project, timeout=120)
+    if rc != 0:
+        raise RuntimeError("Could not create required debug.keystore.\n" + out)
+    return True
+
+
+def safe_repairs(project):
+    changes = []
+
+    if ensure_gradle_property(project, "org.gradle.jvmargs", "-Xmx4g -Dfile.encoding=UTF-8"):
+        changes.append("added Gradle JVM memory setting")
+    if ensure_gradle_property(project, "android.useAndroidX", "true"):
+        changes.append("enabled AndroidX")
+    if ensure_gradle_property(project, "android.nonTransitiveRClass", "false"):
+        changes.append("set nonTransitiveRClass=false")
+
+    for p in Path(project).glob("app/build.gradle*"):
+        txt = read_text(p)
+        if "namespace" not in txt:
+            manifest = Path(project) / "app/src/main/AndroidManifest.xml"
+            m = re.search(r'package\s*=\s*["\']([^"\']+)["\']', read_text(manifest))
+            if m and "android {" in txt:
+                ns = m.group(1)
+                if p.suffix == ".kts":
+                    txt2 = txt.replace("android {", f'android {{\n    namespace = "{ns}"', 1)
+                else:
+                    txt2 = txt.replace("android {", f'android {{\n    namespace "{ns}"', 1)
+                write_text(p, txt2)
+                changes.append(f"added namespace {ns} to {rel(p, project)}")
+
+    for p in Path(project).rglob("build.gradle*"):
+        txt = read_text(p)
+        if "compileSdkVersion" in txt:
+            txt2 = re.sub(r"compileSdkVersion\s+(\d+)", r"compileSdk \1", txt)
+            if txt2 != txt:
+                write_text(p, txt2)
+                changes.append(f"normalized legacy compileSdk syntax in {rel(p, project)}")
+
+    for p in list(Path(project).rglob("build.gradle")) + list(Path(project).rglob("build.gradle.kts")):
+        txt = read_text(p)
+        txt2 = txt.replace("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_17")
+        txt2 = txt2.replace("jvmTarget = '1.8'", "jvmTarget = '17'")
+        txt2 = txt2.replace('jvmTarget = "1.8"', 'jvmTarget = "17"')
+        if txt2 != txt:
+            write_text(p, txt2)
+            changes.append(f"updated explicit Java/Kotlin 1.8 target in {rel(p, project)}")
+
+    if gradlew.exists():
+        os.chmod(gradlew, 0o755)
+        data = gradlew.read_bytes()
+        if b"\r\n" in data:
+            gradlew.write_bytes(data.replace(b"\r\n", b"\n"))
+            changes.append("normalized gradlew line endings")
+
+    try:
+        if ensure_debug_keystore(project, os.environ["JAVA_HOME"]):
+            changes.append("created missing debug.keystore referenced by the project")
+    except Exception as e:
+        log(f"Keystore repair skipped: {e}")
+
+    return changes
+
+
+def snapshot(project, attempt):
+    dest = Path(BACKUP_DIR) / f"attempt_{attempt}"
+    shutil.rmtree(dest, ignore_errors=True)
+    shutil.copytree(project, dest)
+    return dest
+
+
+# ------------------------------------------------------------------
+# 7b. Extended, CI-specific auto-fixes.
+#     Each returns a list of human-readable change descriptions
+#     (empty list = "nothing new to try for this category").
+#     Every fix is tracked so it is only attempted once, which keeps
+#     the MAX_REPAIR_ATTEMPTS loop from spinning forever on a failure
+#     it genuinely cannot resolve.
+# ------------------------------------------------------------------
+
+_TRIED_SDK_PLATFORMS = set()
+_TRIED_BUILD_TOOLS = set()
+_TRIED_JDKS = {17}  # 17 is installed up front
+_NETWORK_RETRIES = 0
+_OOM_LEVEL = 0
+EXTRA_GRADLE_ARGS = [""]  # mutable single-slot holder
+
+
+def fix_missing_sdk(log_text):
+    changes = []
+    for m in set(re.findall(r"android-(\d+)", log_text)):
+        sdk_int = int(m)
+        if sdk_int in _TRIED_SDK_PLATFORMS:
+            continue
+        _TRIED_SDK_PLATFORMS.add(sdk_int)
+        try:
+            install_sdk_platform(sdk_int)
+            changes.append(f"installed missing Android SDK platform android-{sdk_int}")
+        except Exception as e:
+            log(f"Could not install android-{sdk_int}: {e}")
+    bt = re.search(r"Android SDK Build-Tools[^0-9]*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", log_text)
+    if bt and bt.group(1) not in _TRIED_BUILD_TOOLS:
+        version = bt.group(1)
+        _TRIED_BUILD_TOOLS.add(version)
+        try:
+            install_build_tools(version)
+            changes.append(f"installed required Android Build-Tools {version}")
+        except Exception as e:
+            log(f"Could not install build-tools {version}: {e}")
+    return changes
+
+
+_CLASS_FILE_VERSION_TO_JAVA = {
+    68: 22, 67: 22, 66: 21, 65: 21, 64: 20, 63: 19, 62: 18,
+    61: 17, 60: 16, 59: 15, 58: 14, 57: 13, 56: 12, 55: 11,
+    54: 10, 53: 9, 52: 8,
+}
+
+
+def fix_java_compatibility(log_text):
+    target = None
+    m = re.search(r"requires Java (\d+)", log_text, re.I)
+    if m:
+        target = int(m.group(1))
+    if target is None:
+        m = re.search(r"Unsupported class file major version (\d+)", log_text)
+        if m:
+            target = _CLASS_FILE_VERSION_TO_JAVA.get(int(m.group(1)))
+    if target is None:
+        return []
+    # Only common LTS releases are reliably apt-installable.
+    for candidate in sorted({8, 11, 17, 21}, key=lambda v: abs(v - target)):
+        if candidate in _TRIED_JDKS:
+            continue
+        _TRIED_JDKS.add(candidate)
+        try:
+            activate_jdk(candidate)
+            return [f"switched build JDK to {candidate} (Gradle/AGP reported it needs Java {target})"]
+        except Exception as e:
+            log(f"Could not switch to JDK {candidate}: {e}")
+    return []
+
+
+def fix_network_or_dependency(category):
+    global _NETWORK_RETRIES
+    if category not in ("NETWORK", "DEPENDENCY_RESOLUTION"):
+        return []
+    if _NETWORK_RETRIES >= 3:
+        return []
+    _NETWORK_RETRIES += 1
+    time.sleep(15)
+    EXTRA_GRADLE_ARGS[0] = "--refresh-dependencies"
+    return [f"retrying after a transient network/dependency failure (attempt {_NETWORK_RETRIES}/3, "
+            f"forcing --refresh-dependencies)"]
+
+
+def fix_out_of_memory(category):
+    global _OOM_LEVEL
+    if category != "OUT_OF_MEMORY":
+        return []
+    levels = ["4g", "6g", "8g"]
+    if _OOM_LEVEL >= len(levels) - 1:
+        return []
+    _OOM_LEVEL += 1
+    xmx = levels[_OOM_LEVEL]
+    set_gradle_property(PROJECT_HOLDER[0], "org.gradle.jvmargs", f"-Xmx{xmx} -Dfile.encoding=UTF-8")
+    return [f"raised Gradle heap to -Xmx{xmx} after an OutOfMemoryError"]
+
+
+PROJECT_HOLDER = [None]  # set once PROJECT is known, used by fix_out_of_memory
+
+
+# ------------------------------------------------------------------
+# 8. Real Gradle build + diagnosis loop (mirrors notebook Cell 9,
+#    extended with the CI-specific auto-fixes from section 7b)
+# ------------------------------------------------------------------
+
+def wrapper_usable():
+    if not gradlew.exists() or not wrapper_props.exists() or not wrapper_jar.exists():
+        return False
+    try:
+        return wrapper_jar.stat().st_size >= 1024
+    except Exception:
+        return False
+
+
+def ensure_gradle_binary(version):
+    gradle_dir = Path(TOOLS_DIR) / f"gradle-{version}"
+    gradle_bin = gradle_dir / "bin/gradle"
+    if gradle_bin.exists():
+        return gradle_bin
+    archive = Path("/tmp") / f"gradle-{version}-bin.zip"
+    url = f"https://services.gradle.org/distributions/gradle-{version}-bin.zip"
+    log(f"Downloading compatible Gradle: {version}")
+    run_capture(f"wget -q -O '{archive}' '{url}'", timeout=600, check=True)
+    tmp = Path(TOOLS_DIR) / "_gradle_extract"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archive, "r") as z:
+        z.extractall(tmp)
+    extracted = tmp / f"gradle-{version}"
+    if not extracted.exists():
+        raise RuntimeError("Gradle distribution did not contain the expected directory.")
+    shutil.rmtree(gradle_dir, ignore_errors=True)
+    shutil.move(str(extracted), str(gradle_dir))
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.chmod(gradle_bin, 0o755)
+    return gradle_bin
+
+
+def gradle_command():
+    if wrapper_usable():
+        os.chmod(gradlew, 0o755)
+        return "./gradlew"
+    return str(ensure_gradle_binary(GRADLE_VERSION))
+
+
+def extract_error_hints(log_text):
+    patterns = [
+        r"Could not resolve [^\n]+", r"Could not find [^\n]+",
+        r"Namespace not specified[^\n]*", r"uses-sdk:minSdkVersion[^\n]+",
+        r"Manifest merger failed[^\n]*", r"Unresolved reference[^\n]+",
+        r"error:\s+[^\n]+", r"FAILURE:\s+[^\n]+", r"Execution failed for [^\n]+",
+        r"Unsupported class file major version[^\n]+",
+        r"Could not determine the dependencies of [^\n]+",
+        r"Android resource linking failed[^\n]*",
+        r"Could not find or load main class[^\n]+",
+    ]
+    out = []
+    for pat in patterns:
+        out += re.findall(pat, log_text, flags=re.I)
+    return list(dict.fromkeys(out))[:50]
+
+
+def classify_failure(log_text):
+    categories = [
+        ("MISSING_WRAPPER_JAR", r"GradleWrapperMain|gradle-wrapper\.jar"),
+        ("MISSING_SDK", r"SDK location not found|Failed to find target with hash string|ANDROID_HOME"),
+        ("DEPENDENCY_RESOLUTION", r"Could not resolve|Could not find .*\.(jar|aar)|Could not GET"),
+        ("MANIFEST_MERGER", r"Manifest merger failed"),
+        ("DUPLICATE_CLASS", r"Duplicate class"),
+        ("KOTLIN_COMPILE_ERROR", r"e: .*\.kt:\d+:\d+"),
+        ("JAVA_COMPILE_ERROR", r"error: .*\.java"),
+        ("OUT_OF_MEMORY", r"OutOfMemoryError|Java heap space"),
+        ("NETWORK", r"Connect timed out|UnknownHostException|Network is unreachable"),
+        ("JAVA_GRADLE_COMPATIBILITY", r"Unsupported class file major version|requires Java|Android Gradle plugin.*Java"),
+        ("ANDROID_RESOURCE", r"Android resource linking failed|AAPT2"),
+    ]
+    for label, pat in categories:
+        if re.search(pat, log_text, re.I):
+            return label
+    return "UNKNOWN"
+
+
+def extract_error_evidence(log_text):
+    lines = log_text.splitlines()
+    evidence = []
+    pats = [
+        r"error:", r"^e:\s", r"Could not resolve", r"Could not find",
+        r"Unsupported", r"Incompatible", r"Duplicate", r"Missing",
+        r"not found", r"Unresolved reference", r"Execution failed", r"FAILURE:",
+    ]
+    for i, line in enumerate(lines):
+        if any(re.search(p, line, re.I) for p in pats):
+            for x in lines[max(0, i - 2):min(len(lines), i + 6)]:
+                x = x.strip()
+                if x and x not in evidence:
+                    evidence.append(x)
+    return "\n".join(evidence[:120]) or "\n".join(lines[-100:])
+
+
+def build_once(project):
+    task = "assemble" + BUILD_VARIANT.capitalize()
+    extra = EXTRA_GRADLE_ARGS[0]
+    command = f"{gradle_command()} {task} --no-daemon --stacktrace --console=plain {extra}".strip()
+    return run_capture(command, cwd=project, timeout=GRADLE_TIMEOUT_SECONDS)
+
+
+def run_build_loop(project):
+    PROJECT_HOLDER[0] = project
+    build_ok = False
+    build_log = ""
+    failure_category = None
+    error_evidence = ""
+    all_repairs = []
+
+    for attempt in range(1, MAX_REPAIR_ATTEMPTS + 1):
+        log("\n" + "=" * 90)
+        log(f"BUILD ATTEMPT {attempt}/{MAX_REPAIR_ATTEMPTS}")
+        log("=" * 90)
+
+        snapshot(project, attempt)
+        try:
+            rc, out = build_once(project)
+        except subprocess.TimeoutExpired:
+            rc, out = -1, "[TIMEOUT] Gradle build exceeded the configured time limit."
+        except Exception as e:
+            rc, out = -1, f"[BUILD INVOCATION ERROR] {e}"
+
+        build_log = out
+        EXTRA_GRADLE_ARGS[0] = ""  # one-shot flag, reset every attempt
+
+        if rc == 0:
+            build_ok = True
+            log("Gradle build command succeeded.")
+            break
+
+        failure_category = classify_failure(out)
+        error_evidence = extract_error_evidence(out)
+        log(f"Build failed - category: {failure_category}")
+        log("\nReal error evidence:\n" + error_evidence[-12000:])
+
+        changes = safe_repairs(project)
+        changes += fix_missing_sdk(out)
+        changes += fix_java_compatibility(out)
+        changes += fix_network_or_dependency(failure_category)
+        changes += fix_out_of_memory(failure_category)
+
+        if changes:
+            log("\nAutomatic treatment applied:")
+            for c in changes:
+                log(f" - {c}")
+                all_repairs.append({"attempt": attempt, "action": c, "changed": True})
+            continue
+
+        log("\nNo safe deterministic repair matched this failure.")
+        break
+
+    if not build_ok:
+        log("\n# Build diagnosis")
+        log(f"Category: {failure_category}")
+        log("Treatment status: no further safe automatic repair available.")
+        log("The exact Gradle evidence above is the authoritative failure evidence.")
+    else:
+        log("\nBuild stage passed. Proceeding to APK validation.")
+
+    return {
+        "build_ok": build_ok,
+        "build_log": build_log,
+        "failure_category": failure_category,
+        "error_evidence": error_evidence,
+        "repair_log": all_repairs,
+    }
+
+
+# ------------------------------------------------------------------
+# 9. Locate, validate, sign-check, and copy the exact APK
+#    (mirrors notebook Cell 11)
+# ------------------------------------------------------------------
+
+def sha256_file(path):
+    path = Path(path)
+    if not path.exists():
+        raise RuntimeError(f"Cannot calculate SHA-256. File does not exist: {path}")
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def apk_zip_validate(apk):
+    apk = Path(apk)
+    if not apk.exists():
+        raise RuntimeError(f"APK does not exist: {apk}")
+    if not apk.is_file():
+        raise RuntimeError(f"APK path is not a file: {apk}")
+
+    size = apk.stat().st_size
+    if size < 100_000:
+        raise RuntimeError(f"APK is suspiciously small: {size:,} bytes")
+
+    with open(apk, "rb") as f:
+        header = f.read(4)
+    valid_headers = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+    if header not in valid_headers:
+        raise RuntimeError("APK does not have a valid ZIP/APK header.")
+
+    try:
+        with zipfile.ZipFile(apk, "r") as z:
+            bad_file = z.testzip()
+            if bad_file:
+                raise RuntimeError(f"APK ZIP member is corrupt: {bad_file}")
+            names = z.namelist()
+    except zipfile.BadZipFile as e:
+        raise RuntimeError(f"APK is not a valid ZIP/APK file: {e}")
+
+    if "AndroidManifest.xml" not in names:
+        raise RuntimeError("APK is missing AndroidManifest.xml")
+
+    dex_files = [name for name in names if re.fullmatch(r"classes\d*\.dex", name)]
+    if not dex_files:
+        raise RuntimeError("APK contains no classes*.dex file.")
+
+    has_resources = "resources.arsc" in names
+    file_hash = sha256_file(apk)
+
+    return {
+        "path": str(apk), "size": size, "entries": len(names), "dex": dex_files,
+        "has_resources": has_resources, "sha256": file_hash,
+        "zip_integrity": True, "manifest_present": True,
+    }
+
+
+def locate_expected_apk(project):
+    variant = str(BUILD_VARIANT).lower()
+    search_directories = [
+        Path(project) / "app" / "build" / "outputs" / "apk" / variant,
+        Path(project) / "build" / "outputs" / "apk" / variant,
+    ]
+    candidates = []
+    for directory in search_directories:
+        if directory.exists():
+            candidates.extend(p for p in directory.glob("*.apk") if p.is_file())
+
+    if not candidates:
+        base = Path(project) / "app" / "build" / "outputs" / "apk"
+        if base.exists():
+            candidates = [p for p in base.rglob("*.apk") if p.is_file() and variant in p.parts]
+
+    candidates = list(set(candidates))
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+
+    if not candidates:
+        raise RuntimeError("Gradle reported success but no APK was found.")
+
+    expected_name = f"app-{variant}.apk"
+    standard = [p for p in candidates if p.name == expected_name]
+    if len(standard) == 1:
+        return standard[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    raise RuntimeError(
+        "Multiple APK candidates found; refusing to guess:\n" + "\n".join(map(str, candidates))
+    )
+
+
+def find_android_build_tools():
+    sdk_root = Path(ANDROID_SDK_ROOT)
+    build_tools_root = sdk_root / "build-tools"
+    if not build_tools_root.exists():
+        raise RuntimeError(f"Android build-tools directory does not exist:\n{build_tools_root}")
+
+    build_tools_dirs = [p for p in build_tools_root.glob("*") if p.is_dir()]
+
+    def build_tools_version(path):
+        parts = []
+        for part in path.name.split("."):
+            try:
+                parts.append(int(part))
+            except ValueError:
+                parts.append(0)
+        return tuple(parts)
+
+    build_tools_dirs.sort(key=build_tools_version, reverse=True)
+    if not build_tools_dirs:
+        raise RuntimeError("No Android build-tools directory found.")
+
+    build_tools = build_tools_dirs[0]
+    aapt2 = build_tools / "aapt2"
+    aapt = build_tools / "aapt"
+    apksigner = build_tools / "apksigner"
+
+    manifest_tool = aapt2 if aapt2.exists() else (aapt if aapt.exists() else None)
+    if manifest_tool is None:
+        raise RuntimeError("Neither aapt2 nor aapt is available.")
+    if not apksigner.exists():
+        raise RuntimeError("apksigner is unavailable. Refusing to return an unverified APK.")
+
+    return {"root": build_tools, "aapt2": aapt2, "aapt": aapt,
+            "manifest_tool": manifest_tool, "apksigner": apksigner}
+
+
+def validate_and_package_apk(project, build_ok):
+    """Returns a dict describing the validated APK (or the validation
+    failure). Never raises — failure is reported, not propagated, so the
+    PDF report always gets written."""
+    if not build_ok:
+        log("\n" + "=" * 90)
+        log("APK VALIDATION SKIPPED")
+        log("=" * 90)
+        log("Reason: Gradle build did not succeed.")
+        return {"final_apk": None, "validated": False, "info": {"path": None, "validated": False,
+                "error": "Gradle build did not succeed."}}
+
+    try:
+        source_apk = locate_expected_apk(project)
+        log("\n" + "=" * 90)
+        log("GRADLE APK FOUND")
+        log("=" * 90)
+        log(f"APK: {source_apk}")
+
+        log("Validating APK produced by Gradle...")
+        info_before = apk_zip_validate(source_apk)
+        log(f"Source APK ZIP validation: PASS  size={info_before['size']:,}  entries={info_before['entries']}")
+
+        final_apk = Path(OUTPUT_DIR) / "final.apk"
+        shutil.copy2(source_apk, final_apk)
+        log("Binary-safe APK copy: PASS")
+
+        source_hash = sha256_file(source_apk)
+        copied_hash = sha256_file(final_apk)
+        if source_hash != copied_hash:
+            raise RuntimeError("Binary-safe copy failed: source APK and final APK hashes differ.")
+        log(f"Source/final SHA-256 match: PASS  {source_hash}")
+
+        info_final = apk_zip_validate(final_apk)
+        log(f"Final APK ZIP validation: PASS  size={info_final['size']:,}")
+
+        tools = find_android_build_tools()
+        manifest_tool = tools["manifest_tool"]
+        apksigner = tools["apksigner"]
+        log(f"Android Build Tools: {tools['root']}")
+
+        log("Checking Android package information...")
+        manifest_result = subprocess.run(
+            [str(manifest_tool), "dump", "badging", str(final_apk)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+        )
+        if manifest_result.returncode != 0:
+            raise RuntimeError("Android manifest/package decoding failed:\n" + manifest_result.stdout[-12000:])
+        badging = manifest_result.stdout
+        package_match = re.search(
+            r"package:\s+name='([^']+)'(?:\s+versionCode='([^']*)')?(?:\s+versionName='([^']*)')?",
+            badging,
+        )
+        if not package_match:
+            raise RuntimeError("Could not extract package name from APK manifest.")
+        actual_package = package_match.group(1)
+        actual_version_code = package_match.group(2) or ""
+        actual_version_name = package_match.group(3) or ""
+        log(f"Package decoding: PASS  package={actual_package}  versionCode={actual_version_code}  versionName={actual_version_name}")
+
+        log("Checking APK signature...")
+        signature_result = subprocess.run(
+            [str(apksigner), "verify", "--verbose", "--print-certs", str(final_apk)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120,
+        )
+        if signature_result.returncode != 0:
+            raise RuntimeError("APK signature verification FAILED:\n" + signature_result.stdout[-16000:])
+        log("APK signature verification: PASS")
+
+        final_hash = sha256_file(final_apk)
+        if final_hash != info_final["sha256"]:
+            raise RuntimeError("APK changed after validation.")
+        if final_hash != source_hash:
+            raise RuntimeError("Final APK does not exactly match the APK produced by Gradle.")
+        log("Final SHA-256 consistency: PASS")
+
+        apk_info = {
+            "path": str(final_apk), "source_apk": str(source_apk),
+            "size": final_apk.stat().st_size, "sha256": final_hash,
+            "package": actual_package, "version_code": actual_version_code,
+            "version_name": actual_version_name, "variant": str(BUILD_VARIANT),
+            "dex": info_final["dex"], "resources_arsc": info_final["has_resources"],
+            "zip_integrity": True, "manifest_decoding": True,
+            "signature_verified": True, "binary_identity": True,
+        }
+
+        log("\n" + "=" * 90)
+        log("APK FINAL VALIDATION PASSED")
+        log("=" * 90)
+        log(f"Exact validated file: {final_apk}")
+        log(f"Size: {final_apk.stat().st_size:,} bytes")
+        log(f"SHA-256: {final_hash}")
+        log(f"Package: {actual_package}  Version: {actual_version_name} ({actual_version_code})")
+
+        return {"final_apk": str(final_apk), "validated": True, "info": apk_info}
+
+    except Exception as e:
+        log("\n" + "=" * 90)
+        log("APK FINAL VALIDATION FAILED")
+        log("=" * 90)
+        log(f"Reason: {e}")
+        log("The Doctor will NOT return this APK as a trusted final APK.")
+        return {"final_apk": None, "validated": False, "info": {"path": None, "validated": False, "error": str(e)}}
+
+
+# ------------------------------------------------------------------
+# 10. Final report - PDF only, non-interactive
+#     (mirrors notebook Cell 12's report content, but skips the
+#     interactive "choose report format" prompt entirely and never
+#     writes JSON/TXT files - only app_doctor_report.pdf)
+# ------------------------------------------------------------------
+
+def build_report_lines(static_score, diagnoses, build_result, apk_result):
+    problems = [f for f in findings if f["status"] in ("WARN", "WARNING", "FAIL", "ERROR")]
+    information = [f for f in findings if f["status"] == "INFO"]
+
+    build_ok = build_result["build_ok"]
+    apk_validated = apk_result["validated"]
+    apk_info = apk_result["info"]
+
+    build_status = "BUILD SUCCESSFUL" if build_ok else "BUILD FAILED"
+    apk_status = "APK VALIDATED" if apk_validated else "APK NOT VALIDATED"
+    if build_ok and apk_validated:
+        final_result = "APK READY"
+    elif build_ok:
+        final_result = "BUILD SUCCESSFUL - APK VALIDATION FAILED"
+    else:
+        final_result = "BUILD FAILED"
+
+    lines = []
+
+    def add(text=""):
+        lines.append(str(text))
+
+    add("=" * 60)
+    add("                 AI APP DOCTOR PRO")
+    add("=" * 60)
+
+    add()
+    add("PROJECT HEALTH")
+    add("-" * 60)
+    add(f"Score: {static_score}/100")
+    add("Note: This is the static examination score.")
+
+    add()
+    add("EXAMINATION SUMMARY")
+    add("-" * 60)
+    add(f"Total checks: {len(findings)}")
+    add(f"Passed: {len(findings) - len(problems) - len(information)}")
+    add(f"Problems / warnings: {len(problems)}")
+    add(f"Information: {len(information)}")
+
+    add()
+    add("PROBLEMS / WARNINGS")
+    add("-" * 60)
+    if problems:
+        for p in problems:
+            add(f"[WARNING] {p.get('check', 'Unknown')}")
+            add(f"   {p.get('detail', '')}")
+            if p.get("severity"):
+                add(f"   Severity: {p['severity']}")
+    else:
+        add("[OK] No problems detected.")
+
+    add()
+    add("INFORMATION")
+    add("-" * 60)
+    if information:
+        for i in information:
+            add(f"[INFO] {i.get('check', 'Information')}")
+            add(f"   {i.get('detail', '')}")
+    else:
+        add("No additional information.")
+
+    add()
+    add("DIAGNOSIS")
+    add("-" * 60)
+    if diagnoses:
+        for number, d in enumerate(diagnoses, start=1):
+            add()
+            add(f"{number}. {d.get('title', 'Unknown problem')}")
+            add(f"   Severity: {d.get('severity', 'Unknown')}")
+            add(f"   Cause: {d.get('cause', '')}")
+            add(f"   Treatment: {d.get('treatment', '')}")
+            add("   Auto-fix: YES" if d.get("auto") else "   Auto-fix: NO")
+    else:
+        add("[OK] No diagnosis items.")
+
+    add()
+    add("TREATMENT / REPAIRS")
+    add("-" * 60)
+    repair_log = build_result["repair_log"]
+    if repair_log:
+        for r in repair_log:
+            attempt = r.get("attempt", "")
+            action = r.get("action", "Repair completed")
+            prefix = "[OK]" if r.get("changed", True) else "[SKIPPED]"
+            if attempt:
+                add(f"{prefix} Attempt {attempt}: {action}")
+            else:
+                add(f"{prefix} {action}")
+    else:
+        add("No automatic repairs were required.")
+
+    add()
+    add("BUILD RESULT")
+    add("-" * 60)
+    if build_ok:
+        add("[OK] BUILD SUCCESSFUL")
+    else:
+        add("[FAILED] BUILD FAILED")
+        if build_result["failure_category"]:
+            add(f"Failure category: {build_result['failure_category']}")
+        if build_result["error_evidence"]:
+            add()
+            add("ERROR EVIDENCE:")
+            for line in build_result["error_evidence"].splitlines()[:40]:
+                add(f"  {line}")
+
+    add()
+    add("APK VALIDATION")
+    add("-" * 60)
+    if apk_validated:
+        add("[OK] APK VALIDATED")
+        if apk_info.get("package"):
+            add(f"Package: {apk_info['package']}")
+        if apk_info.get("version_name"):
+            add(f"Version: {apk_info['version_name']}")
+        if apk_info.get("version_code"):
+            add(f"Version Code: {apk_info['version_code']}")
+        add(f"Variant: {BUILD_VARIANT}")
+        if apk_info.get("size"):
+            add(f"Size: {apk_info['size']:,} bytes")
+        if apk_info.get("sha256"):
+            add(f"SHA-256: {apk_info['sha256']}")
+    else:
+        add("[FAILED] APK NOT VALIDATED")
+        if apk_info.get("error"):
+            add(f"Reason: {apk_info['error']}")
+
+    add()
+    add("=" * 60)
+    add("FINAL RESULT")
+    add("=" * 60)
+    if build_ok and apk_validated:
+        add("[OK] APK READY")
+        add()
+        add("The project built successfully and the generated APK passed final validation.")
+    elif build_ok:
+        add("[WARNING] BUILD SUCCESSFUL")
+        add()
+        add("The project built, but the APK did not pass final validation.")
+    else:
+        add("[FAILED] BUILD FAILED")
+        add()
+        add("The Doctor could not produce a validated APK.")
+    add()
+    add("=" * 60)
+
+    return lines, build_status, apk_status, final_result
+
+
+def write_pdf_report(lines, pdf_path):
+    try:
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+    except ImportError:
+        log("ReportLab is not installed. Installing it now...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "reportlab", "-q"], check=False)
+        from reportlab.lib.pagesizes import A4
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.units import mm
+
+    pdf = canvas.Canvas(str(pdf_path), pagesize=A4)
+    width, height = A4
+    x = 20 * mm
+    y = height - 20 * mm
+    pdf.setFont("Helvetica", 10)
+
+    replacements = {
+        "\U0001fa7a": "[AI APP DOCTOR]", "\u26a0\ufe0f": "[WARNING]",
+        "\u2705": "[OK]", "\u274c": "[FAILED]", "\u2139\ufe0f": "[INFO]",
+        "\u2713": "[OK]", "\u2022": "-",
+    }
+    for line in lines:
+        safe_line = str(line)
+        for old, new in replacements.items():
+            safe_line = safe_line.replace(old, new)
+        safe_line = safe_line.encode("latin-1", "replace").decode("latin-1")
+        if len(safe_line) > 100:
+            safe_line = safe_line[:97] + "..."
+        pdf.drawString(x, y, safe_line)
+        y -= 5 * mm
+        if y < 20 * mm:
+            pdf.showPage()
+            pdf.setFont("Helvetica", 10)
+            y = height - 20 * mm
+
+    pdf.save()
+    log(f"PDF report saved: {pdf_path}")
+
+
+# ------------------------------------------------------------------
+# 11. Orchestration
+# ------------------------------------------------------------------
+
+def main():
+    static_score = 0
+    diagnoses = []
+    build_result = {"build_ok": False, "build_log": "", "failure_category": None,
+                     "error_evidence": "", "repair_log": []}
+    apk_result = {"final_apk": None, "validated": False,
+                  "info": {"path": None, "validated": False, "error": None}}
+    fatal_error = None
+
+    try:
+        zip_path = find_input_zip()
+
+        ok, msg = safe_extract(zip_path, str(WORK_DIR))
+        if not ok:
+            raise RuntimeError("ZIP examination failed: " + msg)
+
+        project, evidence = detect_project_root(str(WORK_DIR))
+        if not project:
+            raise RuntimeError(
+                "DIAGNOSIS: no recognizable Android/Gradle project was found. "
+                "The ZIP is likely a partial export or the wrong folder."
+            )
+        log(f"Project root: {project}")
+        log(f"settings files: {len(evidence['settings'])}  build files: {len(evidence['build_files'])}  "
+            f"manifests: {len(evidence['manifests'])}")
+
+        static_score = run_examination(project, evidence)
+        diagnoses = diagnose_findings()
+
+        log("\n# Diagnosis")
+        log(f"\nProject Health: {static_score}/100\n")
+        for i, d in enumerate(diagnoses, 1):
+            log(f"{i}. {d['title']} - {d['severity']}")
+            log(f"   Cause: {d['cause']}")
+            log(f"   Treatment: {d['treatment']}")
+            log(f"   Automatic treatment: {'YES' if d['auto'] else 'NO'}")
+
+        prepare_toolchain(project)
+
+        try:
+            apk_result_placeholder = None
+            build_result = run_build_loop(project)
+        except Exception as e:
+            build_result["error_evidence"] = f"{build_result.get('error_evidence', '')}\n\nBuild loop crashed: {e}"
+            log(f"Build loop crashed unexpectedly: {e}")
+
+        apk_result = validate_and_package_apk(project, build_result["build_ok"])
+
+    except Exception as e:
+        fatal_error = str(e)
+        log("\n" + "=" * 90)
+        log("FATAL ERROR - the Doctor could not complete its pipeline")
+        log("=" * 90)
+        log(fatal_error)
+
+    # --- Always produce the PDF report, success or failure ---
+    if fatal_error:
+        findings.append({
+            "check": "Pipeline", "status": "FAIL", "detail": fatal_error, "severity": 3, "evidence": {},
+        })
+        if not diagnoses:
+            diagnoses = [{
+                "title": "Pipeline could not run to completion",
+                "severity": "High", "cause": fatal_error,
+                "treatment": "Fix the reported problem (missing/invalid input ZIP, no Android project found, "
+                             "or a toolchain installation failure) and re-run the workflow.",
+                "auto": False,
+            }]
+
+    lines, build_status, apk_status, final_result = build_report_lines(
+        static_score, diagnoses, build_result, apk_result
+    )
+    for l in lines:
+        log(l)
+
+    pdf_path = OUTPUT_DIR / "app_doctor_report.pdf"
+    write_pdf_report(lines, pdf_path)
+
+    if apk_result["validated"] and apk_result["final_apk"]:
+        final_apk_src = Path(apk_result["final_apk"])
+        pkg = apk_result["info"].get("package") or "app"
+        dest_name = f"{pkg}-{BUILD_VARIANT}-validated.apk"
+        dest = OUTPUT_DIR / dest_name
+        if final_apk_src.resolve() != dest.resolve():
+            shutil.copy2(final_apk_src, dest)
+        log(f"\nValidated APK available at: {dest}")
+
+    log("\n" + "=" * 60)
+    log("AI APP DOCTOR FINISHED")
+    log("=" * 60)
+    log(f"Build: {build_status}")
+    log(f"APK: {apk_status}")
+    log(f"Final Result: {final_result}")
+    log(f"PDF report: {pdf_path}")
+
+    if build_result["build_ok"] and apk_result["validated"]:
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
