@@ -3,34 +3,43 @@ name: AI App Doctor APK Builder
 on:
   workflow_dispatch:
     inputs:
-      zip_url:
-        description: 'Direct download URL of the user uploaded project ZIP'
+      job_id:
+        description: "App Doctor job ID"
         required: true
         type: string
-      callback_url:
-        description: 'The backend webhook URL to post the final status back to'
-        required: false
+
+      input_url:
+        description: "Temporary private download URL for the uploaded ZIP"
+        required: true
         type: string
 
-# CRITICAL CONCURRENCY TUNING:
-# This ensures that your public runner queue processes exactly 1 or 2 builds simultaneously
-# per repository, preventing workspace collisions and managing system overhead.
+      backend_url:
+        description: "Render backend base URL"
+        required: true
+        type: string
+
 concurrency:
-  group: ai-app-doctor-apk-builder
+  group: ai-app-doctor-apk-builder-${{ github.event.inputs.job_id }}
   cancel-in-progress: false
 
 jobs:
   build:
     name: Examine, repair, build and validate APK
     runs-on: ubuntu-latest
-    
-    # Reduced from 180 to 30 minutes to keep your SaaS queue moving fast.
-    # 10,000 people cannot share a queue if broken apps are allowed to hang for 3 hours.
     timeout-minutes: 30
 
     steps:
+
+      # ------------------------------------------------------
+      # Checkout
+      # ------------------------------------------------------
+
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      # ------------------------------------------------------
+      # Python
+      # ------------------------------------------------------
 
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
@@ -40,64 +49,180 @@ jobs:
       - name: Install Python requirements
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
 
-      # HIGH ACCURACY SANITIZATION LAYER:
-      # This completely wipes the environment clean to ensure no cross-user file pollution occurs.
-      - name: Download Remote ZIP file from Backend
+      # ------------------------------------------------------
+      # Prepare workspace
+      # ------------------------------------------------------
+
+      - name: Prepare clean workspace
         run: |
-          echo "Wiping and resetting input workspace..."
+          set -e
+
           rm -rf input
           rm -rf output
+
           mkdir -p input
           mkdir -p output
-          
-          echo "Downloading target file from secure server node..."
-          curl -L "${{ github.event.inputs.zip_url }}" -o input/project.zip
-          
-          # Absolute verification check
+
+          echo "Workspace prepared."
+
+      # ------------------------------------------------------
+      # Download private customer ZIP
+      # ------------------------------------------------------
+
+      - name: Download customer ZIP
+        env:
+          INPUT_URL: ${{ github.event.inputs.input_url }}
+        run: |
+          set -e
+
+          echo "Downloading customer project..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            --max-time 600 \
+            "$INPUT_URL" \
+            --output input/project.zip
+
           if [ ! -s input/project.zip ]; then
-            echo "::error::Network timeout or invalid URL. The ZIP payload was empty."
+            echo "::error::Downloaded ZIP is empty."
             exit 1
           fi
-          
-          echo "Verification Complete: input/project.zip successfully cached for compilation."
 
-      # Hand control off seamlessly to your native AI error-correction system.
+          echo "ZIP downloaded successfully."
+
+          file input/project.zip
+
+      # ------------------------------------------------------
+      # Run App Doctor
+      # ------------------------------------------------------
+
       - name: Run AI App Doctor pipeline
         id: doctor
-        run: python scripts/app_doctor_pipeline.py
+        run: |
+          python scripts/app_doctor_pipeline.py
 
-      # Preserves your resilient upload architecture so you always receive 
-      # diagnostic logs and PDF reports even if the build crashes midway.
-      - name: Upload validated APK + PDF report
+      # ------------------------------------------------------
+      # Find APK
+      # ------------------------------------------------------
+
+      - name: Locate generated APK
+        id: apk
+        if: always()
+        run: |
+          set +e
+
+          APK_PATH=$(find output \
+            -type f \
+            -name "*.apk" \
+            -print \
+            -quit)
+
+          if [ -n "$APK_PATH" ]; then
+            echo "APK found:"
+            echo "$APK_PATH"
+            echo "path=$APK_PATH" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No APK found."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ------------------------------------------------------
+      # Upload APK to Render
+      # ------------------------------------------------------
+
+      - name: Upload APK to backend
+        if: steps.apk.outputs.found == 'true'
+        env:
+          BACKEND_URL: ${{ github.event.inputs.backend_url }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          INTERNAL_API_KEY: ${{ secrets.RENDER_INTERNAL_API_KEY }}
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -e
+
+          if [ -z "$INTERNAL_API_KEY" ]; then
+            echo "::error::RENDER_INTERNAL_API_KEY GitHub secret is missing."
+            exit 1
+          fi
+
+          UPLOAD_URL="${BACKEND_URL%/}/api/internal/jobs/${JOB_ID}/complete"
+
+          echo "Uploading APK to backend..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 3 \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            --max-time 600 \
+            -X POST \
+            -H "X-Internal-Key: ${INTERNAL_API_KEY}" \
+            -F "file=@${APK_PATH};type=application/vnd.android.package-archive" \
+            "$UPLOAD_URL"
+
+          echo "APK successfully uploaded."
+
+      # ------------------------------------------------------
+      # Notify backend of failure
+      # ------------------------------------------------------
+
+      - name: Notify backend of failed build
+        if: failure() && steps.apk.outputs.found != 'true'
+        env:
+          BACKEND_URL: ${{ github.event.inputs.backend_url }}
+          JOB_ID: ${{ github.event.inputs.job_id }}
+          INTERNAL_API_KEY: ${{ secrets.RENDER_INTERNAL_API_KEY }}
+        run: |
+          set +e
+
+          if [ -z "$INTERNAL_API_KEY" ]; then
+            echo "::warning::RENDER_INTERNAL_API_KEY is missing."
+            exit 0
+          fi
+
+          FAILURE_URL="${BACKEND_URL%/}/api/internal/jobs/${JOB_ID}/failed"
+
+          curl \
+            --fail \
+            --location \
+            --max-time 60 \
+            -X POST \
+            -H "X-Internal-Key: ${INTERNAL_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"error":"Android APK build failed."}' \
+            "$FAILURE_URL" || true
+
+      # ------------------------------------------------------
+      # Preserve GitHub artifact
+      # ------------------------------------------------------
+
+      - name: Upload build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ai-app-doctor-validated-output
+          name: ai-app-doctor-${{ github.event.inputs.job_id }}
           path: |
             output/*.apk
             output/*.pdf
           if-no-files-found: warn
-          retention-days: 7 # Lowered from 30 to 7 to optimize GitHub storage usage
+          retention-days: 7
 
-      # SAAS CALL-BACK NOTIFICATION LAYER:
-      # Fires a network signal back to your website backend server the exact second the build 
-      # ends, updating your database so the user's dashboard shifts from "Processing" to "Download Ready".
-      - name: Notify Backend Webhook
+      # ------------------------------------------------------
+      # Cleanup
+      # ------------------------------------------------------
+
+      - name: Cleanup customer files
         if: always()
         run: |
-          if [ -n "${{ github.event.inputs.callback_url }}" ]; then
-            STATUS="failed"
-            if [ -f output/*.apk ]; then
-              STATUS="success"
-            fi
-            
-            echo "Notifying web server at ${{ github.event.inputs.callback_url }} with status: $STATUS"
-            
-            curl -X POST "${{ github.event.inputs.callback_url }}" \
-              -H "Content-Type: application/json" \
-              -d "{\"run_id\": \"${{ github.run_id }}\", \"status\": \"$STATUS\"}"
-          else
-            echo "No callback URL provided. Skipping server notification."
-          fi
+          rm -rf input/project.zip
+          echo "Customer ZIP removed from runner workspace."
